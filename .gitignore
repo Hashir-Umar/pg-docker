@@ -1,0 +1,11 @@
+# Local secrets — never commit. Keep .env.example as the template.
+.env
+*.env
+!.env.example
+
+# Backup dumps — keep the folder, ignore the contents
+/backups/*
+!/backups/.gitkeep
+
+# OS / editor noise
+.DS_Store

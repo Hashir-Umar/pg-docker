@@ -1,0 +1,150 @@
+# docker-compose.prod.yml — PRODUCTION data layer (postgres + pgbouncer + backups).
+#
+# Hardened for self-hosted high-connection / higher-load workloads on a SINGLE
+# node. Adds on top of the dev stack:
+#   - performance tuning (env-driven `-c` flags; size to your box's RAM/CPU)
+#   - CPU / memory resource limits
+#   - a pgbouncer healthcheck
+#   - nightly logical backups with retention (pg-backup service)
+#   - loopback-only host ports by default (front with nginx/TLS for remote apps)
+#
+# Driven entirely by .env.prod (see .env.example). Run via:
+#   ./create-db.sh prod up
+#
+# NOTE: this is single-node. It scales CONNECTIONS (pgbouncer) and load
+# VERTICALLY. It is NOT highly available — see README → "Scaling & limits".
+
+name: ${DB_PREFIX:-pgdb-prod}
+
+services:
+  postgres:
+    image: postgres:${POSTGRES_VERSION:-18-alpine}
+    container_name: ${DB_PREFIX:-pgdb-prod}-postgres
+    restart: unless-stopped
+    # Performance tuning. Defaults assume ~2 GB RAM allotted to postgres.
+    # Rules of thumb: shared_buffers ≈ 25% RAM, effective_cache_size ≈ 75% RAM.
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=${PG_MAX_CONNECTIONS:-100}"
+      - "-c"
+      - "shared_buffers=${PG_SHARED_BUFFERS:-512MB}"
+      - "-c"
+      - "effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-1536MB}"
+      - "-c"
+      - "work_mem=${PG_WORK_MEM:-8MB}"
+      - "-c"
+      - "maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-128MB}"
+      - "-c"
+      - "wal_buffers=${PG_WAL_BUFFERS:-16MB}"
+      - "-c"
+      - "max_wal_size=${PG_MAX_WAL_SIZE:-2GB}"
+      - "-c"
+      - "min_wal_size=${PG_MIN_WAL_SIZE:-512MB}"
+      - "-c"
+      - "checkpoint_completion_target=${PG_CHECKPOINT_COMPLETION_TARGET:-0.9}"
+      - "-c"
+      - "random_page_cost=${PG_RANDOM_PAGE_COST:-1.1}"
+      - "-c"
+      - "effective_io_concurrency=${PG_EFFECTIVE_IO_CONCURRENCY:-200}"
+      - "-c"
+      - "synchronous_commit=${PG_SYNCHRONOUS_COMMIT:-on}"
+    environment:
+      # SUPERUSER — bootstrap only (entrypoint + init.sh on first boot).
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      # Consumed by init.sh on first boot: creates the unprivileged app role + db.
+      APP_DB_USER: ${APP_DB_USER:-app}
+      APP_DB_NAME: ${APP_DB_NAME:-app}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD is required}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    ports:
+      # Loopback only by default. For an app on ANOTHER host, do NOT set
+      # 0.0.0.0 here without TLS — front it with nginx/stunnel. See README.
+      - "${POSTGRES_HOST_BIND:-127.0.0.1}:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./infra/postgres/init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${APP_DB_USER:-app} -d ${APP_DB_NAME:-app}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "${POSTGRES_CPU_LIMIT:-2}"
+          memory: ${POSTGRES_MEMORY_LIMIT:-2g}
+        reservations:
+          memory: ${POSTGRES_MEMORY_RESERVATION:-512m}
+
+  pgbouncer:
+    image: edoburu/pgbouncer:${PGBOUNCER_VERSION:-latest}
+    container_name: ${DB_PREFIX:-pgdb-prod}-pgbouncer
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${APP_DB_USER:-app}
+      DB_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD is required}
+      DB_NAME: ${APP_DB_NAME:-app}
+      AUTH_TYPE: ${PGBOUNCER_AUTH_TYPE:-scram-sha-256}
+      POOL_MODE: ${PGBOUNCER_POOL_MODE:-transaction}
+      LISTEN_PORT: "6432"
+      # High-connection defaults: thousands of clients funnel into a small
+      # server-side pool. Keep DEFAULT_POOL_SIZE well under PG_MAX_CONNECTIONS.
+      MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-1000}
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-25}
+      MIN_POOL_SIZE: ${PGBOUNCER_MIN_POOL_SIZE:-5}
+      RESERVE_POOL_SIZE: ${PGBOUNCER_RESERVE_POOL_SIZE:-5}
+      RESERVE_POOL_TIMEOUT: ${PGBOUNCER_RESERVE_POOL_TIMEOUT:-3}
+      # Allow client-side prepared statements through transaction pooling
+      # (pgbouncer ≥1.21). Set 0 to disable. See README → app requirements.
+      MAX_PREPARED_STATEMENTS: ${PGBOUNCER_MAX_PREPARED_STATEMENTS:-200}
+    ports:
+      - "${PGBOUNCER_HOST_BIND:-127.0.0.1}:${PGBOUNCER_HOST_PORT:-6432}:6432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U ${APP_DB_USER:-app}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "${PGBOUNCER_CPU_LIMIT:-1}"
+          memory: ${PGBOUNCER_MEMORY_LIMIT:-256m}
+
+  # Nightly logical backups (pg_dump) with day/week/month retention.
+  # Writes compressed dumps to ./backups on the host. Trigger manually with:
+  #   ./create-db.sh prod backup
+  pg-backup:
+    image: prodrigestivill/postgres-backup-local:${PG_BACKUP_VERSION:-latest}
+    container_name: ${DB_PREFIX:-pgdb-prod}-backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${APP_DB_USER:-app}
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD is required}
+      POSTGRES_DB: ${APP_DB_NAME:-app}
+      TZ: ${BACKUP_TZ:-UTC}
+      SCHEDULE: ${BACKUP_SCHEDULE:-@daily}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+      BACKUP_KEEP_WEEKS: ${BACKUP_KEEP_WEEKS:-8}
+      BACKUP_KEEP_MONTHS: ${BACKUP_KEEP_MONTHS:-12}
+      # gzip; raise for slower-but-smaller dumps.
+      BACKUP_COMPRESS_LEVEL: ${BACKUP_COMPRESS_LEVEL:-6}
+    volumes:
+      - ${BACKUP_DIR:-./backups}:/backups
+
+volumes:
+  pgdata:

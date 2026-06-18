@@ -1,0 +1,66 @@
+# docker-compose.dev.yml — DEVELOPMENT data layer (postgres + pgbouncer).
+#
+# Optimised for fast local iteration, NOT for load:
+#   - postgres exposed on the host (loopback) so GUI tools / psql / migrations work
+#   - stock postgres tuning (low memory footprint)
+#   - no resource limits, no backups
+#
+# Driven entirely by .env.dev (see .env.example). Run via:
+#   ./create-db.sh dev up
+#
+# To run several dev instances on one machine, give each its own DB_PREFIX and
+# host ports (see README → "Running several instances").
+
+name: ${DB_PREFIX:-pgdb-dev}
+
+services:
+  postgres:
+    image: postgres:${POSTGRES_VERSION:-18-alpine}
+    container_name: ${DB_PREFIX:-pgdb-dev}-postgres
+    restart: unless-stopped
+    environment:
+      # SUPERUSER — bootstrap only (entrypoint + init.sh on first boot).
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      # Consumed by init.sh on first boot: creates the unprivileged app role + db.
+      APP_DB_USER: ${APP_DB_USER:-app}
+      APP_DB_NAME: ${APP_DB_NAME:-app}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD is required}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    ports:
+      # Loopback only — reachable by host tooling, not the public network.
+      - "${POSTGRES_HOST_BIND:-127.0.0.1}:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      # postgres 18+ stores data in a version subdir; mount at the parent.
+      - pgdata:/var/lib/postgresql
+      - ./infra/postgres/init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${APP_DB_USER:-app} -d ${APP_DB_NAME:-app}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pgbouncer:
+    image: edoburu/pgbouncer:${PGBOUNCER_VERSION:-latest}
+    container_name: ${DB_PREFIX:-pgdb-dev}-pgbouncer
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${APP_DB_USER:-app}
+      DB_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD is required}
+      DB_NAME: ${APP_DB_NAME:-app}
+      AUTH_TYPE: ${PGBOUNCER_AUTH_TYPE:-scram-sha-256}
+      POOL_MODE: ${PGBOUNCER_POOL_MODE:-transaction}
+      LISTEN_PORT: "6432"
+      MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-100}
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-20}
+    ports:
+      - "${PGBOUNCER_HOST_BIND:-127.0.0.1}:${PGBOUNCER_HOST_PORT:-6432}:6432"
+
+volumes:
+  pgdata:
