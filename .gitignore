@@ -1,6 +1,6 @@
 # Local secrets — never commit. Keep .env.example as the template.
 .env
-*.env
+*.env.*
 !.env.example
 
 # Backup dumps — keep the folder, ignore the contents
