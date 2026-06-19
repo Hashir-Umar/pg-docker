@@ -2,6 +2,7 @@
 .env
 *.env.*
 !.env.example
+.env.*
 
 # Backup dumps — keep the folder, ignore the contents
 /backups/*
